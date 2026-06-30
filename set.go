@@ -173,6 +173,19 @@ func (s *Set) ToSlice() []any {
 	return out
 }
 
+// EachPair calls fn for every member in insertion order with both its identity
+// key and the stored member value, in a single pass over the internal tables —
+// no per-element membership re-lookup. A host that retains its own per-member
+// data keyed by the identity key (as go-embedded-ruby does for the original Ruby
+// value) can consume an algebra result with EachPair to rebuild its view in one
+// pass, instead of re-deriving each member's key and re-testing Include. The
+// members are exactly those yielded by Each / ToSlice, in the same order.
+func (s *Set) EachPair(fn func(key, member any)) {
+	for _, k := range s.order {
+		fn(k, s.vals[k])
+	}
+}
+
 // Dup returns a shallow copy with the same members in the same order and the same
 // Hasher (Ruby Set#dup / #clone).
 func (s *Set) Dup() *Set {

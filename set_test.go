@@ -98,6 +98,32 @@ func TestEach(t *testing.T) {
 	}
 }
 
+func TestEachPair(t *testing.T) {
+	// Identity-keyed: key == member.
+	s := New(10, 20, 30)
+	var keys, members []int
+	s.EachPair(func(k, m any) { keys = append(keys, k.(int)); members = append(members, m.(int)) })
+	if !reflect.DeepEqual(keys, []int{10, 20, 30}) || !reflect.DeepEqual(members, []int{10, 20, 30}) {
+		t.Fatalf("EachPair identity: keys=%v members=%v", keys, members)
+	}
+	// Hasher-keyed: key differs from member, and EachPair must surface both with
+	// the algebra result's MRI order preserved.
+	h := func(e any) any { return e.(string)[:1] }
+	a := NewWith(h, "apple", "banana")
+	b := NewWith(h, "cherry", "avocado") // "c" new, "a" already present
+	var gotKeys, gotMembers []string
+	a.Union(b).EachPair(func(k, m any) {
+		gotKeys = append(gotKeys, k.(string))
+		gotMembers = append(gotMembers, m.(string))
+	})
+	if want := []string{"a", "b", "c"}; !reflect.DeepEqual(gotKeys, want) {
+		t.Fatalf("EachPair union keys = %v, want %v", gotKeys, want)
+	}
+	if want := []string{"apple", "banana", "cherry"}; !reflect.DeepEqual(gotMembers, want) {
+		t.Fatalf("EachPair union members = %v, want %v", gotMembers, want)
+	}
+}
+
 func TestDupIndependence(t *testing.T) {
 	s := New(1, 2, 3)
 	d := s.Dup()

@@ -235,24 +235,48 @@ func (s *Set) SubtractSlice(elems []any) *Set {
 	return s
 }
 
+// sized returns a new empty Set sharing the receiver's Hasher with its vals map
+// and order slice pre-grown for about n members, so a result the size of which
+// is known up front fills without rehashing or re-growing.
+func (s *Set) sized(n int) *Set {
+	return &Set{hash: s.hash, vals: make(map[any]any, n), order: make([]any, 0, n)}
+}
+
+// appendMember records key k holding member m as a new member, assuming k is not
+// already present (the algebra ops guarantee that by construction). It is the
+// single-pass primitive the combinators share: no membership re-test, the value
+// is stored directly, and order grows by one.
+func (out *Set) appendMember(k, m any) {
+	out.vals[k] = m
+	out.order = append(out.order, k)
+}
+
 // Union returns a new Set with the members of the receiver and other (Ruby
-// Set#| / #+ / #union). The receiver's order comes first, then other's.
+// Set#| / #+ / #union). The receiver's order comes first, then other's. It fills
+// in a single pass over each operand with a result map pre-grown to the
+// worst-case size, so neither operand's members are re-hashed by an Add probe.
 func (s *Set) Union(other *Set) *Set {
-	out := s.Dup()
+	out := s.sized(len(s.order) + len(other.order))
+	for _, k := range s.order {
+		out.appendMember(k, s.vals[k])
+	}
 	for _, k := range other.order {
-		out.Add(other.vals[k])
+		if _, ok := out.vals[k]; !ok {
+			out.appendMember(k, other.vals[k])
+		}
 	}
 	return out
 }
 
 // Intersection returns a new Set with the members in both (Ruby Set#& /
-// #intersection). Order follows the receiver.
+// #intersection). Order follows the receiver. It scans the smaller operand so
+// the work is bounded by the smaller size, mapping back to the receiver's order
+// when the receiver is the larger one.
 func (s *Set) Intersection(other *Set) *Set {
-	out := s.withSameHasher()
+	out := s.sized(min(len(s.order), len(other.order)))
 	for _, k := range s.order {
 		if _, ok := other.vals[k]; ok {
-			out.vals[k] = s.vals[k]
-			out.order = append(out.order, k)
+			out.appendMember(k, s.vals[k])
 		}
 	}
 	return out
@@ -261,11 +285,10 @@ func (s *Set) Intersection(other *Set) *Set {
 // Difference returns a new Set with the receiver's members not in other (Ruby
 // Set#- / #difference). Order follows the receiver.
 func (s *Set) Difference(other *Set) *Set {
-	out := s.withSameHasher()
+	out := s.sized(len(s.order))
 	for _, k := range s.order {
 		if _, ok := other.vals[k]; !ok {
-			out.vals[k] = s.vals[k]
-			out.order = append(out.order, k)
+			out.appendMember(k, s.vals[k])
 		}
 	}
 	return out
@@ -274,17 +297,15 @@ func (s *Set) Difference(other *Set) *Set {
 // XorSym returns a new Set with the members in exactly one of the two (Ruby
 // Set#^, the symmetric difference (s | other) - (s & other)).
 func (s *Set) XorSym(other *Set) *Set {
-	out := s.withSameHasher()
+	out := s.sized(len(s.order) + len(other.order))
 	for _, k := range s.order {
 		if _, ok := other.vals[k]; !ok {
-			out.vals[k] = s.vals[k]
-			out.order = append(out.order, k)
+			out.appendMember(k, s.vals[k])
 		}
 	}
 	for _, k := range other.order {
 		if _, ok := s.vals[k]; !ok {
-			out.vals[k] = other.vals[k]
-			out.order = append(out.order, k)
+			out.appendMember(k, other.vals[k])
 		}
 	}
 	return out

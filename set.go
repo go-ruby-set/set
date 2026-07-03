@@ -28,6 +28,7 @@ package set
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -42,10 +43,19 @@ type Hasher func(elem any) any
 // Set is an MRI-faithful Ruby Set: an unordered collection of unique members with
 // set algebra, iterated in first-insertion order. The zero value is not usable;
 // construct one with New or NewWith.
+//
+// The members are held as two parallel insertion-ordered slices — keys[i] is the
+// identity key of members[i] — plus an index map from key to presence. Iteration
+// (Each / ToSlice / the algebra source loops) walks the slices directly, so a
+// member is never re-fetched through a map lookup; the map is consulted only for
+// membership tests. When the Hasher is nil a key is its own member, so the two
+// slices hold the same values but are kept distinct to keep the hashed and
+// unhashed paths uniform.
 type Set struct {
-	hash  Hasher      // member -> comparable key (nil => key by self)
-	vals  map[any]any // key -> member (the canonical retained member)
-	order []any       // keys in insertion order, for Ruby iteration ordering
+	hash    Hasher           // member -> comparable key (nil => key by self)
+	index   map[any]struct{} // key -> present (membership only)
+	keys    []any            // identity keys in insertion order
+	members []any            // parallel to keys: the canonical retained member
 }
 
 // key reduces a member to its comparable identity key.
@@ -64,9 +74,16 @@ func New(elems ...any) *Set {
 
 // NewWith returns a Set whose membership and equality are decided by h, seeded
 // with the given members. A nil h keys members by themselves (like New). This is
-// the form a host with Ruby hash / eql? semantics uses.
+// the form a host with Ruby hash / eql? semantics uses. The internal tables are
+// pre-grown for the seed count, so seeding a known number of members neither
+// rehashes the index nor re-grows the order slices.
 func NewWith(h Hasher, elems ...any) *Set {
-	s := &Set{hash: h, vals: make(map[any]any)}
+	s := &Set{
+		hash:    h,
+		index:   make(map[any]struct{}, len(elems)),
+		keys:    make([]any, 0, len(elems)),
+		members: make([]any, 0, len(elems)),
+	}
 	for _, e := range elems {
 		s.Add(e)
 	}
@@ -76,22 +93,23 @@ func NewWith(h Hasher, elems ...any) *Set {
 // withSameHasher returns a new empty Set sharing the receiver's Hasher, so a
 // derived Set keys members identically.
 func (s *Set) withSameHasher() *Set {
-	return &Set{hash: s.hash, vals: make(map[any]any)}
+	return &Set{hash: s.hash, index: make(map[any]struct{})}
 }
 
 // Size returns the number of members (Ruby Set#size / #length / #count).
-func (s *Set) Size() int { return len(s.order) }
+func (s *Set) Size() int { return len(s.keys) }
 
 // Empty reports whether the Set has no members (Ruby Set#empty?).
-func (s *Set) Empty() bool { return len(s.order) == 0 }
+func (s *Set) Empty() bool { return len(s.keys) == 0 }
 
 // Add inserts elem, returning the Set for chaining (Ruby Set#add / #<<). Adding a
 // member already present is a no-op that preserves the original member.
 func (s *Set) Add(elem any) *Set {
 	k := s.key(elem)
-	if _, ok := s.vals[k]; !ok {
-		s.vals[k] = elem
-		s.order = append(s.order, k)
+	if _, ok := s.index[k]; !ok {
+		s.index[k] = struct{}{}
+		s.keys = append(s.keys, k)
+		s.members = append(s.members, elem)
 	}
 	return s
 }
@@ -100,11 +118,12 @@ func (s *Set) Add(elem any) *Set {
 // when added, nil when already present — modelled here as a bool).
 func (s *Set) AddQ(elem any) bool {
 	k := s.key(elem)
-	if _, ok := s.vals[k]; ok {
+	if _, ok := s.index[k]; ok {
 		return false
 	}
-	s.vals[k] = elem
-	s.order = append(s.order, k)
+	s.index[k] = struct{}{}
+	s.keys = append(s.keys, k)
+	s.members = append(s.members, elem)
 	return true
 }
 
@@ -119,22 +138,25 @@ func (s *Set) Delete(elem any) *Set {
 // when removed, nil when absent — modelled here as a bool).
 func (s *Set) DeleteQ(elem any) bool {
 	k := s.key(elem)
-	if _, ok := s.vals[k]; !ok {
+	if _, ok := s.index[k]; !ok {
 		return false
 	}
 	s.deleteKey(k)
 	return true
 }
 
-// deleteKey removes a key from both the map and the insertion order.
+// deleteKey removes a key from the index and from the parallel order slices,
+// shifting later members down so first-insertion order is preserved (matching
+// MRI, where deleting a member leaves the rest in their original order).
 func (s *Set) deleteKey(k any) {
-	if _, ok := s.vals[k]; !ok {
+	if _, ok := s.index[k]; !ok {
 		return
 	}
-	delete(s.vals, k)
-	for i, ok := range s.order {
-		if ok == k {
-			s.order = append(s.order[:i], s.order[i+1:]...)
+	delete(s.index, k)
+	for i, kk := range s.keys {
+		if kk == k {
+			s.keys = append(s.keys[:i], s.keys[i+1:]...)
+			s.members = append(s.members[:i], s.members[i+1:]...)
 			break
 		}
 	}
@@ -142,22 +164,24 @@ func (s *Set) deleteKey(k any) {
 
 // Include reports whether elem is a member (Ruby Set#include? / #member? / #===).
 func (s *Set) Include(elem any) bool {
-	_, ok := s.vals[s.key(elem)]
+	_, ok := s.index[s.key(elem)]
 	return ok
 }
 
 // Clear removes every member, returning the Set for chaining (Ruby Set#clear).
 func (s *Set) Clear() *Set {
-	s.vals = make(map[any]any)
-	s.order = nil
+	s.index = make(map[any]struct{})
+	s.keys = nil
+	s.members = nil
 	return s
 }
 
 // Each calls fn for every member in insertion order (Ruby Set#each). Returning a
-// non-nil error from fn stops iteration and propagates it.
+// non-nil error from fn stops iteration and propagates it. It walks the member
+// slice directly — no per-element map lookup.
 func (s *Set) Each(fn func(elem any) error) error {
-	for _, k := range s.order {
-		if err := fn(s.vals[k]); err != nil {
+	for _, m := range s.members {
+		if err := fn(m); err != nil {
 			return err
 		}
 	}
@@ -166,10 +190,8 @@ func (s *Set) Each(fn func(elem any) error) error {
 
 // ToSlice returns the members as a slice in insertion order (Ruby Set#to_a).
 func (s *Set) ToSlice() []any {
-	out := make([]any, len(s.order))
-	for i, k := range s.order {
-		out[i] = s.vals[k]
-	}
+	out := make([]any, len(s.members))
+	copy(out, s.members)
 	return out
 }
 
@@ -181,28 +203,28 @@ func (s *Set) ToSlice() []any {
 // pass, instead of re-deriving each member's key and re-testing Include. The
 // members are exactly those yielded by Each / ToSlice, in the same order.
 func (s *Set) EachPair(fn func(key, member any)) {
-	for _, k := range s.order {
-		fn(k, s.vals[k])
+	for i, k := range s.keys {
+		fn(k, s.members[i])
 	}
 }
 
 // Dup returns a shallow copy with the same members in the same order and the same
 // Hasher (Ruby Set#dup / #clone).
 func (s *Set) Dup() *Set {
-	out := s.withSameHasher()
-	for _, k := range s.order {
-		out.vals[k] = s.vals[k]
+	return &Set{
+		hash:    s.hash,
+		index:   maps.Clone(s.index),
+		keys:    append(make([]any, 0, len(s.keys)), s.keys...),
+		members: append(make([]any, 0, len(s.members)), s.members...),
 	}
-	out.order = append(out.order, s.order...)
-	return out
 }
 
 // Merge adds every member of each other Set, returning the receiver for chaining
 // (Ruby Set#merge). The receiver is mutated.
 func (s *Set) Merge(others ...*Set) *Set {
 	for _, o := range others {
-		for _, k := range o.order {
-			s.Add(o.vals[k])
+		for _, m := range o.members {
+			s.Add(m)
 		}
 	}
 	return s
@@ -220,7 +242,7 @@ func (s *Set) MergeSlice(elems []any) *Set {
 // Subtract removes every member of other, returning the receiver for chaining
 // (Ruby Set#subtract). The receiver is mutated.
 func (s *Set) Subtract(other *Set) *Set {
-	for _, k := range other.order {
+	for _, k := range other.keys {
 		s.deleteKey(k)
 	}
 	return s
@@ -235,20 +257,26 @@ func (s *Set) SubtractSlice(elems []any) *Set {
 	return s
 }
 
-// sized returns a new empty Set sharing the receiver's Hasher with its vals map
-// and order slice pre-grown for about n members, so a result the size of which
+// sized returns a new empty Set sharing the receiver's Hasher with its index map
+// and order slices pre-grown for about n members, so a result the size of which
 // is known up front fills without rehashing or re-growing.
 func (s *Set) sized(n int) *Set {
-	return &Set{hash: s.hash, vals: make(map[any]any, n), order: make([]any, 0, n)}
+	return &Set{
+		hash:    s.hash,
+		index:   make(map[any]struct{}, n),
+		keys:    make([]any, 0, n),
+		members: make([]any, 0, n),
+	}
 }
 
 // appendMember records key k holding member m as a new member, assuming k is not
 // already present (the algebra ops guarantee that by construction). It is the
-// single-pass primitive the combinators share: no membership re-test, the value
-// is stored directly, and order grows by one.
+// single-pass primitive the combinators share: no membership re-test, the key is
+// marked present and the parallel order slices grow by one.
 func (out *Set) appendMember(k, m any) {
-	out.vals[k] = m
-	out.order = append(out.order, k)
+	out.index[k] = struct{}{}
+	out.keys = append(out.keys, k)
+	out.members = append(out.members, m)
 }
 
 // Union returns a new Set with the members of the receiver and other (Ruby
@@ -256,13 +284,20 @@ func (out *Set) appendMember(k, m any) {
 // in a single pass over each operand with a result map pre-grown to the
 // worst-case size, so neither operand's members are re-hashed by an Add probe.
 func (s *Set) Union(other *Set) *Set {
-	out := s.sized(len(s.order) + len(other.order))
-	for _, k := range s.order {
-		out.appendMember(k, s.vals[k])
+	n := len(s.keys) + len(other.keys)
+	// Clone the receiver wholesale — a bulk map copy plus two slice copies — so the
+	// receiver's members are carried over without re-hashing each key through an
+	// individual index insert, then fold in only the members of other not already
+	// present. This is measurably faster than inserting both operands one by one.
+	out := &Set{
+		hash:    s.hash,
+		index:   maps.Clone(s.index),
+		keys:    append(make([]any, 0, n), s.keys...),
+		members: append(make([]any, 0, n), s.members...),
 	}
-	for _, k := range other.order {
-		if _, ok := out.vals[k]; !ok {
-			out.appendMember(k, other.vals[k])
+	for i, k := range other.keys {
+		if _, ok := out.index[k]; !ok {
+			out.appendMember(k, other.members[i])
 		}
 	}
 	return out
@@ -273,10 +308,10 @@ func (s *Set) Union(other *Set) *Set {
 // the work is bounded by the smaller size, mapping back to the receiver's order
 // when the receiver is the larger one.
 func (s *Set) Intersection(other *Set) *Set {
-	out := s.sized(min(len(s.order), len(other.order)))
-	for _, k := range s.order {
-		if _, ok := other.vals[k]; ok {
-			out.appendMember(k, s.vals[k])
+	out := s.sized(min(len(s.keys), len(other.keys)))
+	for i, k := range s.keys {
+		if _, ok := other.index[k]; ok {
+			out.appendMember(k, s.members[i])
 		}
 	}
 	return out
@@ -285,10 +320,10 @@ func (s *Set) Intersection(other *Set) *Set {
 // Difference returns a new Set with the receiver's members not in other (Ruby
 // Set#- / #difference). Order follows the receiver.
 func (s *Set) Difference(other *Set) *Set {
-	out := s.sized(len(s.order))
-	for _, k := range s.order {
-		if _, ok := other.vals[k]; !ok {
-			out.appendMember(k, s.vals[k])
+	out := s.sized(len(s.keys))
+	for i, k := range s.keys {
+		if _, ok := other.index[k]; !ok {
+			out.appendMember(k, s.members[i])
 		}
 	}
 	return out
@@ -297,15 +332,15 @@ func (s *Set) Difference(other *Set) *Set {
 // XorSym returns a new Set with the members in exactly one of the two (Ruby
 // Set#^, the symmetric difference (s | other) - (s & other)).
 func (s *Set) XorSym(other *Set) *Set {
-	out := s.sized(len(s.order) + len(other.order))
-	for _, k := range s.order {
-		if _, ok := other.vals[k]; !ok {
-			out.appendMember(k, s.vals[k])
+	out := s.sized(len(s.keys) + len(other.keys))
+	for i, k := range s.keys {
+		if _, ok := other.index[k]; !ok {
+			out.appendMember(k, s.members[i])
 		}
 	}
-	for _, k := range other.order {
-		if _, ok := s.vals[k]; !ok {
-			out.appendMember(k, other.vals[k])
+	for i, k := range other.keys {
+		if _, ok := s.index[k]; !ok {
+			out.appendMember(k, other.members[i])
 		}
 	}
 	return out
@@ -314,11 +349,11 @@ func (s *Set) XorSym(other *Set) *Set {
 // SubsetQ reports whether every member of the receiver is in other (Ruby
 // Set#subset? / #<=).
 func (s *Set) SubsetQ(other *Set) bool {
-	if len(s.order) > len(other.order) {
+	if len(s.keys) > len(other.keys) {
 		return false
 	}
-	for _, k := range s.order {
-		if _, ok := other.vals[k]; !ok {
+	for _, k := range s.keys {
+		if _, ok := other.index[k]; !ok {
 			return false
 		}
 	}
@@ -328,7 +363,7 @@ func (s *Set) SubsetQ(other *Set) bool {
 // ProperSubsetQ reports whether the receiver is a subset of other and not equal
 // to it (Ruby Set#proper_subset? / #<).
 func (s *Set) ProperSubsetQ(other *Set) bool {
-	return len(s.order) < len(other.order) && s.SubsetQ(other)
+	return len(s.keys) < len(other.keys) && s.SubsetQ(other)
 }
 
 // SupersetQ reports whether every member of other is in the receiver (Ruby
@@ -346,11 +381,11 @@ func (s *Set) ProperSupersetQ(other *Set) bool {
 // DisjointQ reports whether the two sets share no member (Ruby Set#disjoint?).
 func (s *Set) DisjointQ(other *Set) bool {
 	small, large := s, other
-	if len(large.order) < len(small.order) {
+	if len(large.keys) < len(small.keys) {
 		small, large = large, small
 	}
-	for _, k := range small.order {
-		if _, ok := large.vals[k]; ok {
+	for _, k := range small.keys {
+		if _, ok := large.index[k]; ok {
 			return false
 		}
 	}
@@ -365,11 +400,11 @@ func (s *Set) IntersectQ(other *Set) bool {
 
 // EqualQ reports whether the two sets have the same members (Ruby Set#==).
 func (s *Set) EqualQ(other *Set) bool {
-	if len(s.order) != len(other.order) {
+	if len(s.keys) != len(other.keys) {
 		return false
 	}
-	for _, k := range s.order {
-		if _, ok := other.vals[k]; !ok {
+	for _, k := range s.keys {
+		if _, ok := other.index[k]; !ok {
 			return false
 		}
 	}
@@ -379,9 +414,9 @@ func (s *Set) EqualQ(other *Set) bool {
 // Map applies fn to each member in insertion order and returns the results as a
 // slice (Ruby Set#map / #collect returns an Array, not a Set).
 func (s *Set) Map(fn func(elem any) any) []any {
-	out := make([]any, 0, len(s.order))
-	for _, k := range s.order {
-		out = append(out, fn(s.vals[k]))
+	out := make([]any, 0, len(s.members))
+	for _, m := range s.members {
+		out = append(out, fn(m))
 	}
 	return out
 }
@@ -390,10 +425,9 @@ func (s *Set) Map(fn func(elem any) any) []any {
 // #filter).
 func (s *Set) Select(fn func(elem any) bool) *Set {
 	out := s.withSameHasher()
-	for _, k := range s.order {
-		if fn(s.vals[k]) {
-			out.vals[k] = s.vals[k]
-			out.order = append(out.order, k)
+	for i, k := range s.keys {
+		if fn(s.members[i]) {
+			out.appendMember(k, s.members[i])
 		}
 	}
 	return out
@@ -423,8 +457,7 @@ func (s *Set) CollectBang(fn func(elem any) any) *Set {
 // ClassifyResult also records the original block value for each group.
 func (s *Set) Classify(fn func(elem any) any) *ClassifyResult {
 	res := &ClassifyResult{order: nil, groups: make(map[any]*ClassGroup)}
-	for _, k := range s.order {
-		elem := s.vals[k]
+	for _, elem := range s.members {
 		bv := fn(elem)
 		bk := s.key(bv)
 		g, ok := res.groups[bk]
@@ -481,8 +514,7 @@ func (r *ClassifyResult) Get(bv any, h Hasher) (*Set, bool) {
 // Hash{value => Array}).
 func (s *Set) GroupBy(fn func(elem any) any) *GroupByResult {
 	res := &GroupByResult{groups: make(map[any]*GroupByBucket)}
-	for _, k := range s.order {
-		elem := s.vals[k]
+	for _, elem := range s.members {
 		bv := fn(elem)
 		bk := s.key(bv)
 		g, ok := res.groups[bk]
@@ -588,11 +620,11 @@ func (s *Set) FlattenSet() *Set {
 	out := s.withSameHasher()
 	var walk func(cur *Set)
 	walk = func(cur *Set) {
-		for _, k := range cur.order {
-			if nested, ok := cur.vals[k].(*Set); ok {
+		for _, m := range cur.members {
+			if nested, ok := m.(*Set); ok {
 				walk(nested)
 			} else {
-				out.Add(cur.vals[k])
+				out.Add(m)
 			}
 		}
 	}
@@ -606,11 +638,11 @@ func (s *Set) FlattenSet() *Set {
 func (s *Set) Inspect(stringFn func(elem any) string) string {
 	var b strings.Builder
 	b.WriteString("Set[")
-	for i, k := range s.order {
+	for i, m := range s.members {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString(stringFn(s.vals[k]))
+		b.WriteString(stringFn(m))
 	}
 	b.WriteByte(']')
 	return b.String()

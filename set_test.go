@@ -422,3 +422,107 @@ func TestHasher(t *testing.T) {
 		t.Errorf("Union with Hasher = %d members", u.Size())
 	}
 }
+
+// TestOrderPreservationLarge exercises the presized build and the single-pass
+// algebra on a larger, non-trivial input, asserting the exact MRI-observable
+// insertion order at every step (not just membership). It guards the optimized
+// bulk paths — presized NewWith, maps.Clone-based Union, and the parallel-slice
+// iteration — against any reordering regression.
+func TestOrderPreservationLarge(t *testing.T) {
+	const n = 500
+	// Interleave a descending then ascending pattern so insertion order differs
+	// from any natural sort — a reordering bug could not hide behind sortedness.
+	elems := make([]any, 0, 2*n)
+	want := make([]int, 0, 2*n)
+	for i := n - 1; i >= 0; i-- {
+		elems = append(elems, i)
+		want = append(want, i)
+	}
+	for i := 0; i < n; i++ {
+		elems = append(elems, 1000+i)
+		want = append(want, 1000+i)
+	}
+	// Re-append the whole thing: every duplicate must be a no-op keeping order.
+	elems = append(elems, elems...)
+	s := New(elems...) // presized NewWith path
+	if s.Size() != len(want) {
+		t.Fatalf("Size = %d, want %d", s.Size(), len(want))
+	}
+	if got := asInts(s); !reflect.DeepEqual(got, want) {
+		t.Fatalf("build order mismatch: first10=%v want %v", got[:10], want[:10])
+	}
+
+	// Union: receiver order first, then other's new members, in order.
+	other := make([]any, 0, n)
+	for i := 0; i < n; i++ {
+		other = append(other, 5000+i) // all disjoint
+	}
+	o := New(other...)
+	u := s.Union(o)
+	uWant := append(append([]int{}, want...), intRange(5000, n)...)
+	if got := asInts(u); !reflect.DeepEqual(got, uWant) {
+		t.Fatalf("Union order mismatch at len %d vs %d", len(got), len(uWant))
+	}
+	// Union must not mutate either operand.
+	if s.Size() != len(want) || o.Size() != n {
+		t.Fatal("Union mutated an operand")
+	}
+
+	// Difference keeps receiver order for the survivors.
+	d := s.Difference(New(intAnys(0, 250)...))
+	dWant := make([]int, 0)
+	for _, v := range want {
+		if v >= 250 { // 0..249 removed
+			dWant = append(dWant, v)
+		}
+	}
+	if got := asInts(d); !reflect.DeepEqual(got, dWant) {
+		t.Fatalf("Difference order mismatch")
+	}
+
+	// XorSym: receiver-only members (in receiver order) then other-only.
+	x := s.XorSym(u) // u ⊇ s, so receiver-only is empty, other-only = the 5000 block
+	if got, want := asInts(x), intRange(5000, n); !reflect.DeepEqual(got, want) {
+		t.Fatalf("XorSym order mismatch")
+	}
+
+	// Delete preserves the order of the remaining members.
+	s.Delete(n - 1) // removes the very first inserted key
+	if got := asInts(s); !reflect.DeepEqual(got, want[1:]) {
+		t.Fatalf("Delete did not preserve remaining order")
+	}
+}
+
+// TestDupLargeOrderAndIndependence checks the maps.Clone-based Dup carries the
+// full member order and is independent of the source.
+func TestDupLargeOrderAndIndependence(t *testing.T) {
+	src := New(intAnys(0, 300)...)
+	want := intRange(0, 300)
+	d := src.Dup()
+	if got := asInts(d); !reflect.DeepEqual(got, want) {
+		t.Fatal("Dup order mismatch")
+	}
+	d.Add(9999).Delete(0)
+	if src.Include(9999) || !src.Include(0) {
+		t.Fatal("Dup not independent of source")
+	}
+	if got := asInts(src); !reflect.DeepEqual(got, want) {
+		t.Fatal("source order changed after mutating Dup")
+	}
+}
+
+func intRange(start, count int) []int {
+	out := make([]int, count)
+	for i := range out {
+		out[i] = start + i
+	}
+	return out
+}
+
+func intAnys(start, count int) []any {
+	out := make([]any, count)
+	for i := range out {
+		out[i] = start + i
+	}
+	return out
+}

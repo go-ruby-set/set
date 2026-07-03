@@ -28,7 +28,6 @@ package set
 
 import (
 	"fmt"
-	"maps"
 	"sort"
 	"strings"
 )
@@ -45,17 +44,23 @@ type Hasher func(elem any) any
 // construct one with New or NewWith.
 //
 // The members are held as two parallel insertion-ordered slices — keys[i] is the
-// identity key of members[i] — plus an index map from key to presence. Iteration
-// (Each / ToSlice / the algebra source loops) walks the slices directly, so a
-// member is never re-fetched through a map lookup; the map is consulted only for
-// membership tests. When the Hasher is nil a key is its own member, so the two
-// slices hold the same values but are kept distinct to keep the hashed and
-// unhashed paths uniform.
+// identity key of members[i] — plus a membership index from key to presence.
+// Iteration (Each / ToSlice / the algebra source loops) walks the slices
+// directly, so a member is never re-fetched through a map lookup; the index is
+// consulted only for membership tests. When the Hasher is nil a key is its own
+// member, so the two slices hold the same values but are kept distinct to keep
+// the hashed and unhashed paths uniform.
+//
+// The membership index (see membership) keeps a concrete-typed map for the common
+// homogeneous key types (all int, all int64, all string) and falls back to a
+// generic map[any] only for mixed or other-typed sets, so the frequent case
+// avoids interface-hashing every key while every Ruby-observable semantic —
+// including the distinctness of int(1), int64(1), 1.0 and "1" — is preserved.
 type Set struct {
-	hash    Hasher           // member -> comparable key (nil => key by self)
-	index   map[any]struct{} // key -> present (membership only)
-	keys    []any            // identity keys in insertion order
-	members []any            // parallel to keys: the canonical retained member
+	hash    Hasher     // member -> comparable key (nil => key by self)
+	midx    membership // key -> present (membership only)
+	keys    []any      // identity keys in insertion order
+	members []any      // parallel to keys: the canonical retained member
 }
 
 // key reduces a member to its comparable identity key.
@@ -80,7 +85,7 @@ func New(elems ...any) *Set {
 func NewWith(h Hasher, elems ...any) *Set {
 	s := &Set{
 		hash:    h,
-		index:   make(map[any]struct{}, len(elems)),
+		midx:    newMembership(len(elems)),
 		keys:    make([]any, 0, len(elems)),
 		members: make([]any, 0, len(elems)),
 	}
@@ -93,7 +98,7 @@ func NewWith(h Hasher, elems ...any) *Set {
 // withSameHasher returns a new empty Set sharing the receiver's Hasher, so a
 // derived Set keys members identically.
 func (s *Set) withSameHasher() *Set {
-	return &Set{hash: s.hash, index: make(map[any]struct{})}
+	return &Set{hash: s.hash}
 }
 
 // Size returns the number of members (Ruby Set#size / #length / #count).
@@ -106,8 +111,7 @@ func (s *Set) Empty() bool { return len(s.keys) == 0 }
 // member already present is a no-op that preserves the original member.
 func (s *Set) Add(elem any) *Set {
 	k := s.key(elem)
-	if _, ok := s.index[k]; !ok {
-		s.index[k] = struct{}{}
+	if s.midx.add(k) {
 		s.keys = append(s.keys, k)
 		s.members = append(s.members, elem)
 	}
@@ -118,10 +122,9 @@ func (s *Set) Add(elem any) *Set {
 // when added, nil when already present — modelled here as a bool).
 func (s *Set) AddQ(elem any) bool {
 	k := s.key(elem)
-	if _, ok := s.index[k]; ok {
+	if !s.midx.add(k) {
 		return false
 	}
-	s.index[k] = struct{}{}
 	s.keys = append(s.keys, k)
 	s.members = append(s.members, elem)
 	return true
@@ -138,7 +141,7 @@ func (s *Set) Delete(elem any) *Set {
 // when removed, nil when absent — modelled here as a bool).
 func (s *Set) DeleteQ(elem any) bool {
 	k := s.key(elem)
-	if _, ok := s.index[k]; !ok {
+	if !s.midx.has(k) {
 		return false
 	}
 	s.deleteKey(k)
@@ -149,10 +152,10 @@ func (s *Set) DeleteQ(elem any) bool {
 // shifting later members down so first-insertion order is preserved (matching
 // MRI, where deleting a member leaves the rest in their original order).
 func (s *Set) deleteKey(k any) {
-	if _, ok := s.index[k]; !ok {
+	if !s.midx.has(k) {
 		return
 	}
-	delete(s.index, k)
+	s.midx.del(k)
 	for i, kk := range s.keys {
 		if kk == k {
 			s.keys = append(s.keys[:i], s.keys[i+1:]...)
@@ -164,13 +167,12 @@ func (s *Set) deleteKey(k any) {
 
 // Include reports whether elem is a member (Ruby Set#include? / #member? / #===).
 func (s *Set) Include(elem any) bool {
-	_, ok := s.index[s.key(elem)]
-	return ok
+	return s.midx.has(s.key(elem))
 }
 
 // Clear removes every member, returning the Set for chaining (Ruby Set#clear).
 func (s *Set) Clear() *Set {
-	s.index = make(map[any]struct{})
+	s.midx = membership{}
 	s.keys = nil
 	s.members = nil
 	return s
@@ -213,7 +215,7 @@ func (s *Set) EachPair(fn func(key, member any)) {
 func (s *Set) Dup() *Set {
 	return &Set{
 		hash:    s.hash,
-		index:   maps.Clone(s.index),
+		midx:    s.midx.clone(),
 		keys:    append(make([]any, 0, len(s.keys)), s.keys...),
 		members: append(make([]any, 0, len(s.members)), s.members...),
 	}
@@ -263,7 +265,7 @@ func (s *Set) SubtractSlice(elems []any) *Set {
 func (s *Set) sized(n int) *Set {
 	return &Set{
 		hash:    s.hash,
-		index:   make(map[any]struct{}, n),
+		midx:    newMembership(n),
 		keys:    make([]any, 0, n),
 		members: make([]any, 0, n),
 	}
@@ -274,7 +276,7 @@ func (s *Set) sized(n int) *Set {
 // single-pass primitive the combinators share: no membership re-test, the key is
 // marked present and the parallel order slices grow by one.
 func (out *Set) appendMember(k, m any) {
-	out.index[k] = struct{}{}
+	out.midx.putNew(k)
 	out.keys = append(out.keys, k)
 	out.members = append(out.members, m)
 }
@@ -291,12 +293,12 @@ func (s *Set) Union(other *Set) *Set {
 	// present. This is measurably faster than inserting both operands one by one.
 	out := &Set{
 		hash:    s.hash,
-		index:   maps.Clone(s.index),
+		midx:    s.midx.clone(),
 		keys:    append(make([]any, 0, n), s.keys...),
 		members: append(make([]any, 0, n), s.members...),
 	}
 	for i, k := range other.keys {
-		if _, ok := out.index[k]; !ok {
+		if !out.midx.has(k) {
 			out.appendMember(k, other.members[i])
 		}
 	}
@@ -310,7 +312,7 @@ func (s *Set) Union(other *Set) *Set {
 func (s *Set) Intersection(other *Set) *Set {
 	out := s.sized(min(len(s.keys), len(other.keys)))
 	for i, k := range s.keys {
-		if _, ok := other.index[k]; ok {
+		if other.midx.has(k) {
 			out.appendMember(k, s.members[i])
 		}
 	}
@@ -322,7 +324,7 @@ func (s *Set) Intersection(other *Set) *Set {
 func (s *Set) Difference(other *Set) *Set {
 	out := s.sized(len(s.keys))
 	for i, k := range s.keys {
-		if _, ok := other.index[k]; !ok {
+		if !other.midx.has(k) {
 			out.appendMember(k, s.members[i])
 		}
 	}
@@ -334,12 +336,12 @@ func (s *Set) Difference(other *Set) *Set {
 func (s *Set) XorSym(other *Set) *Set {
 	out := s.sized(len(s.keys) + len(other.keys))
 	for i, k := range s.keys {
-		if _, ok := other.index[k]; !ok {
+		if !other.midx.has(k) {
 			out.appendMember(k, s.members[i])
 		}
 	}
 	for i, k := range other.keys {
-		if _, ok := s.index[k]; !ok {
+		if !s.midx.has(k) {
 			out.appendMember(k, other.members[i])
 		}
 	}
@@ -353,7 +355,7 @@ func (s *Set) SubsetQ(other *Set) bool {
 		return false
 	}
 	for _, k := range s.keys {
-		if _, ok := other.index[k]; !ok {
+		if !other.midx.has(k) {
 			return false
 		}
 	}
@@ -385,7 +387,7 @@ func (s *Set) DisjointQ(other *Set) bool {
 		small, large = large, small
 	}
 	for _, k := range small.keys {
-		if _, ok := large.index[k]; ok {
+		if large.midx.has(k) {
 			return false
 		}
 	}
@@ -404,7 +406,7 @@ func (s *Set) EqualQ(other *Set) bool {
 		return false
 	}
 	for _, k := range s.keys {
-		if _, ok := other.index[k]; !ok {
+		if !other.midx.has(k) {
 			return false
 		}
 	}
